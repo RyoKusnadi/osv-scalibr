@@ -20,11 +20,15 @@ import (
 	"errors"
 	"io/fs"
 	"slices"
+	"strings"
 
 	"github.com/google/osv-scalibr/extractor"
 	"github.com/google/osv-scalibr/extractor/filesystem"
 	"github.com/google/osv-scalibr/extractor/filesystem/ffa/unknownbinariesextr"
+	apkmeta "github.com/google/osv-scalibr/extractor/filesystem/os/apk/metadata"
+	dpkgmeta "github.com/google/osv-scalibr/extractor/filesystem/os/dpkg/metadata"
 	"github.com/google/osv-scalibr/extractor/filesystem/os/osrelease"
+	rpmmeta "github.com/google/osv-scalibr/extractor/filesystem/os/rpm/metadata"
 	"github.com/google/osv-scalibr/inventory"
 	"github.com/google/osv-scalibr/log"
 
@@ -36,6 +40,49 @@ import (
 type locationAndIndex struct {
 	location string
 	index    int
+}
+
+// packageKey uniquely identifies a package within a layer without depending on /etc/os-release
+// fields (which may be populated or updated in a different layer than the package database).
+type packageKey struct {
+	plugin        string
+	location      string
+	name          string
+	version       string
+	arch          string
+	origin        string
+	sourceVersion string
+	epoch         int
+}
+
+func newPackageKey(pkg *extractor.Package, plugin string) packageKey {
+	key := packageKey{
+		plugin:   plugin,
+		location: pkg.Location.PathOrEmpty(),
+		name:     pkg.Name,
+		version:  pkg.Version,
+	}
+	switch m := pkg.Metadata.(type) {
+	case *apkmeta.Metadata:
+		if m != nil {
+			key.name = strings.ToLower(pkg.Name)
+			key.arch = m.Architecture
+			key.origin = m.OriginName
+		}
+	case *dpkgmeta.Metadata:
+		if m != nil {
+			key.arch = m.Architecture
+			key.origin = m.SourceName
+			key.sourceVersion = m.SourceVersion
+		}
+	case *rpmmeta.Metadata:
+		if m != nil {
+			key.arch = m.Architecture
+			key.origin = m.SourceRPM
+			key.epoch = m.Epoch
+		}
+	}
+	return key
 }
 
 // PopulateLayerDetails populates the LayerDetails field of the inventory with the origin details
@@ -89,6 +136,7 @@ func PopulateLayerDetails(ctx context.Context, inv *inventory.Inventory, chainLa
 	// locationIndexToPackages is used as a package cache to avoid re-extracting the same
 	// package from a file multiple times.
 	locationIndexToPackages := map[locationAndIndex][]*extractor.Package{}
+	locationIndexToPackageKeys := map[locationAndIndex]map[packageKey]bool{}
 	lastLayerIndex := len(chainLayers) - 1
 
 	// Build a map from the extractor list for faster access.
@@ -113,10 +161,8 @@ func PopulateLayerDetails(ctx context.Context, inv *inventory.Inventory, chainLa
 			continue
 		}
 
-		var pkgPURL string
-		if pkg.PURL() != nil {
-			pkgPURL = pkg.PURL().String()
-		}
+		isUnknownBinary := slices.Contains(pkg.Plugins, unknownbinariesextr.Name)
+		pkgKey := newPackageKey(pkg, pkgExtractor.Name())
 
 		var foundOrigin bool
 		fileLocation := pkg.Location.PathOrEmpty()
@@ -134,8 +180,9 @@ func PopulateLayerDetails(ctx context.Context, inv *inventory.Inventory, chainLa
 			}
 
 			var oldPackages []*extractor.Package
-			if cachedPackages, ok := locationIndexToPackages[pkgLocationAndIndex]; ok {
-				oldPackages = cachedPackages
+			oldPackageKeys, cached := locationIndexToPackageKeys[pkgLocationAndIndex]
+			if cached {
+				oldPackages = locationIndexToPackages[pkgLocationAndIndex]
 			} else if _, err := oldChainLayer.FS().Stat(fileLocation); errors.Is(err, fs.ErrNotExist) {
 				// Check if file still exist in this layer, if not skip extraction.
 				// This is both an optimization, and avoids polluting the log output with false file not found errors.
@@ -161,27 +208,30 @@ func PopulateLayerDetails(ctx context.Context, inv *inventory.Inventory, chainLa
 				continue
 			}
 
-			// Cache the packages for future use.
-			locationIndexToPackages[pkgLocationAndIndex] = oldPackages
-
-			foundPackage := false
-			for _, oldPKG := range oldPackages {
-				// If the package is from unknown binaries extractor, only Locations will be filled
-				// We should skip the purl check
-				if !slices.Contains(pkg.Plugins, unknownbinariesextr.Name) {
-					// PURLs are being used as a package key, so if they are different, skip this package.
-					oldPKGPURL := oldPKG.PURL()
-					if oldPKGPURL == nil || oldPKGPURL.String() != pkgPURL {
+			if !cached {
+				// Cache the packages and their keys for future use.
+				oldPackageKeys = make(map[packageKey]bool, len(oldPackages))
+				for _, oldPKG := range oldPackages {
+					if !isLocationEqual(oldPKG.Location, pkg.Location) {
 						continue
 					}
+					oldPackageKeys[newPackageKey(oldPKG, pkgExtractor.Name())] = true
 				}
+				locationIndexToPackages[pkgLocationAndIndex] = oldPackages
+				locationIndexToPackageKeys[pkgLocationAndIndex] = oldPackageKeys
+			}
 
-				if !isLocationEqual(oldPKG.Location, pkg.Location) {
-					continue
+			foundPackage := false
+			if isUnknownBinary {
+				// If the package is from unknown binaries extractor, only Locations will be filled.
+				for _, oldPKG := range oldPackages {
+					if isLocationEqual(oldPKG.Location, pkg.Location) {
+						foundPackage = true
+						break
+					}
 				}
-
-				foundPackage = true
-				break
+			} else {
+				foundPackage = oldPackageKeys[pkgKey]
 			}
 
 			// If the package is not present in the old layer, then it was introduced in the previous layer we actually scanned

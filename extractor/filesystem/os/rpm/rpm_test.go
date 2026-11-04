@@ -15,6 +15,7 @@
 package rpm_test
 
 import (
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
@@ -34,6 +35,7 @@ import (
 	rpmmeta "github.com/google/osv-scalibr/extractor/filesystem/os/rpm/metadata"
 	"github.com/google/osv-scalibr/extractor/filesystem/simplefileapi"
 	scalibrfs "github.com/google/osv-scalibr/fs"
+	scalibrlog "github.com/google/osv-scalibr/log"
 	"github.com/google/osv-scalibr/purl"
 	"github.com/google/osv-scalibr/stats"
 	"github.com/google/osv-scalibr/testing/fakefs"
@@ -931,4 +933,133 @@ func scalibrFilesInTmp(t *testing.T) []string {
 		}
 	}
 	return filenames
+}
+
+type testLogger struct {
+	warnings []string
+	errors   []string
+}
+
+func (l *testLogger) Errorf(format string, args ...any) {
+	l.errors = append(l.errors, fmt.Sprintf(format, args...))
+}
+
+func (l *testLogger) Error(args ...any) {
+	l.errors = append(l.errors, fmt.Sprint(args...))
+}
+
+func (l *testLogger) Warnf(format string, args ...any) {
+	l.warnings = append(l.warnings, fmt.Sprintf(format, args...))
+}
+
+func (l *testLogger) Warn(args ...any) {
+	l.warnings = append(l.warnings, fmt.Sprint(args...))
+}
+
+func (testLogger) Infof(string, ...any)  {}
+func (testLogger) Info(...any)           {}
+func (testLogger) Debugf(string, ...any) {}
+func (testLogger) Debug(...any)          {}
+
+func TestExtract_OSReleaseLogging(t *testing.T) {
+	t.Cleanup(func() {
+		scalibrlog.SetLogger(&scalibrlog.DefaultLogger{})
+	})
+
+	tests := []struct {
+		name              string
+		hasOSRelease      bool
+		osrelease         string
+		wantWarningPrefix string
+		wantWarnings      []string
+	}{
+		{
+			name:         "valid_osrelease",
+			hasOSRelease: true,
+			osrelease:    fedora38,
+		},
+		{
+			name:              "nonexistent_osrelease",
+			hasOSRelease:      false,
+			wantWarningPrefix: "osrelease.ParseOsRelease():",
+		},
+		{
+			name:         "missing_id",
+			hasOSRelease: true,
+			osrelease:    "VERSION_ID=38",
+			wantWarnings: []string{"os-release is missing key(s): ID"},
+		},
+		{
+			name:         "missing_version_id",
+			hasOSRelease: true,
+			osrelease:    "ID=fedora\nBUILD_ID=asdf",
+			wantWarnings: []string{"os-release is missing key(s): VERSION_ID"},
+		},
+		{
+			name:         "missing_id_and_version_id",
+			hasOSRelease: true,
+			osrelease:    "",
+			wantWarnings: []string{"os-release is missing key(s): ID, VERSION_ID"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logger := &testLogger{}
+			scalibrlog.SetLogger(logger)
+
+			d := t.TempDir()
+			if tt.hasOSRelease {
+				createOsRelease(t, d, tt.osrelease)
+			}
+
+			path := "testdata/Packages"
+			tmpPath, err := CopyFileToTempDir(t, path, d)
+			if err != nil {
+				t.Fatalf("CopyFileToTempDir(%s) error: %v", path, err)
+			}
+
+			info, err := os.Stat(tmpPath)
+			if err != nil {
+				t.Fatalf("Failed to stat test file: %v", err)
+			}
+
+			e, err := rpm.New(&cpb.PluginConfig{})
+			if err != nil {
+				t.Fatalf("rpm.New: %v", err)
+			}
+
+			input := &filesystem.ScanInput{
+				FS:   scalibrfs.DirFS(filepath.Dir(tmpPath)),
+				Path: filepath.Base(tmpPath),
+				Root: filepath.Dir(tmpPath),
+				Info: info,
+			}
+
+			got, err := e.Extract(t.Context(), input)
+			if err != nil {
+				t.Fatalf("Extract(%s) unexpected error: %v", tmpPath, err)
+			}
+			if len(got.Packages) != 148 {
+				t.Fatalf("Extract(%s) returned %d packages, want 148", tmpPath, len(got.Packages))
+			}
+
+			// Verify metadata getters ToNamespace/ToDistro remain silent across all packages.
+			for _, p := range got.Packages {
+				_ = p.PURL()
+				_ = p.Ecosystem()
+			}
+
+			if len(logger.errors) != 0 {
+				t.Errorf("Extract(%s) recorded errors %v, want none", tmpPath, logger.errors)
+			}
+			if tt.wantWarningPrefix != "" {
+				if len(logger.warnings) != 1 || !strings.HasPrefix(logger.warnings[0], tt.wantWarningPrefix) {
+					t.Errorf("Extract(%s) recorded warnings %v, want 1 warning with prefix %q", tmpPath, logger.warnings, tt.wantWarningPrefix)
+				}
+			} else if diff := cmp.Diff(tt.wantWarnings, logger.warnings); diff != "" {
+				t.Errorf("Extract(%s) warnings (-want +got):\n%s", tmpPath, diff)
+			}
+		})
+	}
 }

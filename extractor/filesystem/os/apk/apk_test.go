@@ -19,6 +19,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -31,6 +32,7 @@ import (
 	"github.com/google/osv-scalibr/extractor/filesystem/simplefileapi"
 	scalibrfs "github.com/google/osv-scalibr/fs"
 	"github.com/google/osv-scalibr/inventory"
+	scalibrlog "github.com/google/osv-scalibr/log"
 	"github.com/google/osv-scalibr/purl"
 	"github.com/google/osv-scalibr/stats"
 	"github.com/google/osv-scalibr/testing/fakefs"
@@ -333,5 +335,140 @@ func createOsRelease(t *testing.T, root string, content string) {
 	err := os.WriteFile(filepath.Join(root, "etc/os-release"), []byte(content), 0644)
 	if err != nil {
 		t.Fatalf("write to %s: %v\n", filepath.Join(root, "etc/os-release"), err)
+	}
+}
+
+type testLogger struct {
+	warnings []string
+	errors   []string
+}
+
+func (l *testLogger) Errorf(format string, args ...any) {
+	l.errors = append(l.errors, fmt.Sprintf(format, args...))
+}
+
+func (l *testLogger) Error(args ...any) {
+	l.errors = append(l.errors, fmt.Sprint(args...))
+}
+
+func (l *testLogger) Warnf(format string, args ...any) {
+	l.warnings = append(l.warnings, fmt.Sprintf(format, args...))
+}
+
+func (l *testLogger) Warn(args ...any) {
+	l.warnings = append(l.warnings, fmt.Sprint(args...))
+}
+
+func (testLogger) Infof(string, ...any)  {}
+func (testLogger) Info(...any)           {}
+func (testLogger) Debugf(string, ...any) {}
+func (testLogger) Debug(...any)          {}
+
+func TestExtract_OSReleaseLogging(t *testing.T) {
+	t.Cleanup(func() {
+		scalibrlog.SetLogger(&scalibrlog.DefaultLogger{})
+	})
+
+	tests := []struct {
+		name              string
+		hasOSRelease      bool
+		osrelease         string
+		wantWarningPrefix string
+		wantWarnings      []string
+	}{
+		{
+			name:         "valid_osrelease",
+			hasOSRelease: true,
+			osrelease:    alpine,
+		},
+		{
+			name:              "nonexistent_osrelease",
+			hasOSRelease:      false,
+			wantWarningPrefix: "osrelease.ParseOsRelease():",
+		},
+		{
+			name:         "missing_id",
+			hasOSRelease: true,
+			osrelease:    "VERSION_ID=3.18.0",
+			wantWarnings: []string{"os-release is missing key(s): ID"},
+		},
+		{
+			name:         "missing_version_id",
+			hasOSRelease: true,
+			osrelease:    "ID=openwrt",
+			wantWarnings: []string{"os-release is missing key(s): VERSION_ID"},
+		},
+		{
+			name:         "missing_id_and_version_id",
+			hasOSRelease: true,
+			osrelease:    "",
+			wantWarnings: []string{"os-release is missing key(s): ID, VERSION_ID"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logger := &testLogger{}
+			scalibrlog.SetLogger(logger)
+
+			e, err := apk.New(&cpb.PluginConfig{})
+			if err != nil {
+				t.Fatalf("apk.New: %v", err)
+			}
+
+			d := t.TempDir()
+			if tt.hasOSRelease {
+				createOsRelease(t, d, tt.osrelease)
+			}
+
+			path := "testdata/installed"
+			r, err := os.Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				if err := r.Close(); err != nil {
+					t.Errorf("Close(): %v", err)
+				}
+			}()
+
+			info, err := os.Stat(path)
+			if err != nil {
+				t.Fatalf("Failed to stat test file: %v", err)
+			}
+
+			input := &filesystem.ScanInput{
+				FS:     scalibrfs.DirFS(d),
+				Path:   path,
+				Reader: r,
+				Root:   d,
+				Info:   info,
+			}
+
+			got, err := e.Extract(t.Context(), input)
+			if err != nil {
+				t.Fatalf("Extract(%s) unexpected error: %v", path, err)
+			}
+			if len(got.Packages) != 15 {
+				t.Fatalf("Extract(%s) returned %d packages, want 15", path, len(got.Packages))
+			}
+
+			// Verify metadata getters ToNamespace/ToDistro remain silent across all packages.
+			for _, p := range got.Packages {
+				_ = p.PURL()
+				_ = p.Ecosystem()
+			}
+
+			if len(logger.errors) != 0 {
+				t.Errorf("Extract(%s) recorded errors %v, want none", path, logger.errors)
+			}
+			if tt.wantWarningPrefix != "" {
+				if len(logger.warnings) != 1 || !strings.HasPrefix(logger.warnings[0], tt.wantWarningPrefix) {
+					t.Errorf("Extract(%s) recorded warnings %v, want 1 warning with prefix %q", path, logger.warnings, tt.wantWarningPrefix)
+				}
+			} else if diff := cmp.Diff(tt.wantWarnings, logger.warnings); diff != "" {
+				t.Errorf("Extract(%s) warnings (-want +got):\n%s", path, diff)
+			}
+		})
 	}
 }
